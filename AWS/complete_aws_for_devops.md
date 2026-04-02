@@ -32,6 +32,32 @@ Compute:   long-running → EC2 | containerised → ECS/EKS |
 
 ---
 
+## 📌 TABLE OF CONTENTS
+> Click any link to jump directly to that section
+
+| # | Section | Key Topics |
+|---|---|---|
+| 1 | [EC2 Deep Dive](#part-1--ec2-deep-dive) | Instance types, EBS, ASG, Spot, Placement Groups |
+| 2 | [S3 Deep Dive](#part-2--s3-deep-dive) | Storage classes, Versioning, Lifecycle, Security |
+| 3 | [Database Comparison](#part-3--database-comparison-when-to-use-what) | RDS vs DynamoDB vs Redis vs OpenSearch decision guide |
+| 4 | [RDS + Aurora](#part-4--rds--aurora) | Multi-AZ, Read Replicas, Aurora, DMS migration |
+| 5 | [CloudWatch](#part-5--cloudwatch-deep-dive) | Metrics, Logs Insights, Alarms, Agent |
+| 6 | [Route53](#part-6--route53) | DNS types, Routing policies, Health checks, Failover |
+| 7 | [SQS + SNS + EventBridge](#part-7--sqs--sns--eventbridge) | Queues, Pub-sub, Event-driven patterns |
+| 8 | [AWS Security](#part-8--aws-security) | WAF, Shield, GuardDuty, Security Hub, Macie |
+| 9 | [ECS Deep Dive](#part-9--ecs-deep-dive) | Task definitions, Fargate, Service discovery, vs EKS |
+| 10 | [Cost Optimisation](#part-10--cost-optimisation) | Reserved, Savings Plans, Spot, S3 tiers, tools |
+| 11 | [AWS Networking Overview](#part-11--aws-networking-deep-dive) | VPC Peering, TGW, Direct Connect, VPN overview |
+| 12 | [CloudFormation vs Terraform](#part-12--cloudformation-vs-terraform) | When to use which, SAM, CDK |
+| 13 | [Well-Architected Framework](#part-13--aws-well-architected-framework) | All 6 pillars, WAT tool |
+| 14 | [**VPC Complete Deep Dive**](#part-14--vpc-complete-deep-dive) | **Full VPC reference — all components** |
+
+### ⚡ VPC Section Quick Jump:
+> [VPC & Subnets](#vpc--subnets) · [IGW](#internet-gateway-igw) · [NAT Gateway](#nat-gateway-ngw) · [SG vs NACLs](#security-groups-vs-nacls) · [VPC Peering](#vpc-peering) · [Transit Gateway](#transit-gateway-tgw) · [Site-to-Site VPN](#site-to-site-vpn) · [Direct Connect](#direct-connect) · [VPN CloudHub](#vpn-cloudhub) · [PrivateLink & Endpoints](#aws-privatelink--vpc-endpoints) · [Flow Logs](#vpc-flow-logs) · [Traffic Mirroring](#traffic-mirroring) · [Egress-Only IGW](#egress-only-internet-gateway) · [Comparison Table](#networking-comparison-table) · [Interview Q&A](#vpc-interview-questions)
+
+
+---
+
 ## PART 1 — EC2 DEEP DIVE
 
 ### EC2 Instance Types
@@ -2444,4 +2470,1026 @@ Transit Gateway:
 
 Use peering: 2-3 VPCs, simple connectivity
 Use TGW: 4+ VPCs, mixed connectivity, on-premises
+```
+
+---
+
+## PART 14 — VPC COMPLETE DEEP DIVE
+
+> Back to [Table of Contents](#table-of-contents)
+
+---
+
+### VPC & Subnets
+
+```
+VPC (Virtual Private Cloud):
+  Your own isolated network within AWS
+  Region-scoped (spans all AZs in that region)
+  CIDR block: defines IP address range (e.g. 10.0.0.0/16 = 65,536 IPs)
+  Default VPC: created automatically in each region (172.31.0.0/16)
+               Don't use default VPC for production
+
+Key VPC limits:
+  5 VPCs per region (soft limit, can increase)
+  5 CIDRs per VPC (can add secondary CIDRs)
+  Cannot modify primary CIDR after creation
+
+CIDR planning best practices:
+  Use RFC 1918 ranges:
+    10.0.0.0/8     → large enterprise
+    172.16.0.0/12  → medium
+    192.168.0.0/16 → small / home
+  Plan for future growth (use /16 for VPC — gives 65K IPs)
+  Non-overlapping: VPCs that peer must have different CIDRs
+  Reserve ranges per environment:
+    10.0.0.0/16  → prod
+    10.1.0.0/16  → staging
+    10.2.0.0/16  → dev
+```
+
+```
+Subnets:
+  Subdivision of VPC in ONE specific AZ
+  Public subnet:  has route to Internet Gateway → internet-accessible
+  Private subnet: no route to IGW → no direct internet access
+                  uses NAT Gateway for outbound internet
+  Isolated subnet: no route anywhere outside VPC
+                   use for: databases, internal services
+
+Subnet sizing:
+  AWS reserves 5 IPs per subnet (first 4 + last 1)
+  /24 subnet = 256 IPs → 251 usable
+  /28 subnet = 16 IPs  → 11 usable (minimum useful size)
+
+Typical 3-tier architecture per AZ:
+  Public  (10.0.1.0/24): Load balancers, NAT Gateway, Bastion host
+  Private (10.0.2.0/24): Application servers, EKS nodes, Lambda
+  Data    (10.0.3.0/24): RDS, ElastiCache, internal services
+  × 3 AZs = 9 subnets total for HA
+```
+
+```bash
+# Create VPC
+aws ec2 create-vpc \
+  --cidr-block 10.0.0.0/16 \
+  --tag-specifications 'ResourceType=vpc,Tags=[{Key=Name,Value=judicial-prod-vpc}]'
+
+# Enable DNS hostnames (required for many AWS services)
+aws ec2 modify-vpc-attribute \
+  --vpc-id vpc-12345678 \
+  --enable-dns-hostnames
+
+# Create subnets
+aws ec2 create-subnet \
+  --vpc-id vpc-12345678 \
+  --cidr-block 10.0.1.0/24 \
+  --availability-zone ap-south-1a \
+  --tag-specifications 'ResourceType=subnet,Tags=[{Key=Name,Value=public-1a}]'
+
+aws ec2 create-subnet \
+  --vpc-id vpc-12345678 \
+  --cidr-block 10.0.2.0/24 \
+  --availability-zone ap-south-1a \
+  --tag-specifications 'ResourceType=subnet,Tags=[{Key=Name,Value=private-1a}]'
+```
+
+---
+
+### Internet Gateway (IGW)
+
+```
+IGW = door between your VPC and the public internet
+  Horizontally scaled, redundant, highly available (no management)
+  One IGW per VPC
+  Free — no data processing charge (pay for data transfer)
+  Stateful: allows return traffic automatically
+  Performs NAT for instances with public IPs
+
+For a subnet to be "public":
+  1. VPC has an IGW attached
+  2. Subnet route table has: 0.0.0.0/0 → igw-xxxxxx
+  3. Instance has a public IP or Elastic IP
+
+Without IGW:
+  No inbound from internet
+  No outbound to internet
+  Internal VPC communication still works
+```
+
+```bash
+# Create and attach IGW
+aws ec2 create-internet-gateway \
+  --tag-specifications 'ResourceType=internet-gateway,Tags=[{Key=Name,Value=judicial-igw}]'
+
+aws ec2 attach-internet-gateway \
+  --internet-gateway-id igw-12345678 \
+  --vpc-id vpc-12345678
+
+# Create public route table
+aws ec2 create-route-table \
+  --vpc-id vpc-12345678 \
+  --tag-specifications 'ResourceType=route-table,Tags=[{Key=Name,Value=public-rt}]'
+
+# Add default route to IGW
+aws ec2 create-route \
+  --route-table-id rtb-12345678 \
+  --destination-cidr-block 0.0.0.0/0 \
+  --gateway-id igw-12345678
+
+# Associate route table with public subnet
+aws ec2 associate-route-table \
+  --route-table-id rtb-12345678 \
+  --subnet-id subnet-12345678
+```
+
+---
+
+### NAT Gateway (NGW)
+
+```
+NAT Gateway = allows private subnet resources to reach internet
+              while blocking inbound connections from internet
+
+Why:
+  Private EC2/ECS/Lambda needs: yum update, pip install, API calls
+  But you don't want inbound connections from internet (security)
+  NAT Gateway translates private IP → its own public IP → internet
+
+Key facts:
+  Deployed in PUBLIC subnet (needs internet access itself)
+  Has an Elastic IP attached
+  Route: private subnet → NAT GW → IGW → internet
+  Managed by AWS (no patching, auto-scales, HA within an AZ)
+  NOT free: $0.045/hr + $0.045/GB data processed
+
+NAT Gateway vs NAT Instance:
+  NAT Gateway:  managed, auto-scales, HA, more expensive
+  NAT Instance: EC2 you manage, single point of failure, cheaper
+                Only use NAT Instance for cost saving in dev/test
+                AWS recommends NAT Gateway for production
+
+High Availability:
+  NAT Gateway is AZ-specific (NOT cross-AZ)
+  If NAT GW AZ fails → private subnets in that AZ lose internet
+  HA setup: one NAT GW per AZ + private subnet routes to same-AZ NAT GW
+
+            AZ-1a                    AZ-1b
+  Private subnet ─→ NAT GW 1a      Private subnet ─→ NAT GW 1b
+                        ↓                                  ↓
+                       IGW ←────────────────────────────────
+```
+
+```bash
+# Allocate Elastic IP for NAT Gateway
+aws ec2 allocate-address --domain vpc
+
+# Create NAT Gateway in public subnet
+aws ec2 create-nat-gateway \
+  --subnet-id subnet-public-1a \
+  --allocation-id eipalloc-12345678 \
+  --tag-specifications 'ResourceType=natgateway,Tags=[{Key=Name,Value=nat-gw-1a}]'
+
+# Create private route table
+aws ec2 create-route-table \
+  --vpc-id vpc-12345678 \
+  --tag-specifications 'ResourceType=route-table,Tags=[{Key=Name,Value=private-rt-1a}]'
+
+# Route private subnet traffic through NAT GW
+aws ec2 create-route \
+  --route-table-id rtb-private-1a \
+  --destination-cidr-block 0.0.0.0/0 \
+  --nat-gateway-id nat-12345678
+
+# Associate private route table with private subnet
+aws ec2 associate-route-table \
+  --route-table-id rtb-private-1a \
+  --subnet-id subnet-private-1a
+```
+
+---
+
+### Security Groups vs NACLs
+
+```
+Security Groups (SG):                  NACLs (Network ACL):
+─────────────────────                  ─────────────────────
+Applied to: ENI/Instance               Applied to: Subnet
+Stateful: return traffic auto-allowed  Stateless: must allow both directions
+Rules: Allow only                      Rules: Allow AND Deny
+Evaluation: all rules evaluated        Evaluation: rules in number order (lowest first)
+Default: deny inbound, allow outbound  Default NACL: allow all
+Chaining: reference other SGs          No SG reference
+
+When to use what:
+  Security Group: primary security mechanism (always use)
+  NACL: additional layer, block specific IPs/ports at subnet level
+        Great for: blocking known malicious IPs, port-level restrictions
+
+Security Group best practices:
+  Never use 0.0.0.0/0 as inbound source (except for public-facing LBs)
+  Reference security groups instead of IPs where possible
+    ALB SG → allows 443 from 0.0.0.0/0
+    App SG → allows 8080 from ALB SG only (not from internet)
+    DB SG  → allows 5432 from App SG only
+  Separate SGs per tier (ALB, app, DB)
+
+NACL rules example:
+  Rule 100: Allow TCP 443 from 0.0.0.0/0  INBOUND
+  Rule 200: Allow TCP 80 from 0.0.0.0/0   INBOUND
+  Rule 300: Allow TCP 1024-65535 (ephemeral ports) INBOUND  ← REQUIRED (stateless)
+  Rule *:   Deny all
+  
+  Rule 100: Allow all OUTBOUND to 0.0.0.0/0
+  Rule *:   Deny all
+```
+
+---
+
+### VPC Peering
+
+```
+VPC Peering = private connection between two VPCs
+  Traffic stays on AWS backbone (not internet)
+  Works: same account, different accounts, different regions (inter-region peering)
+  
+  Key limitation: NO TRANSITIVE ROUTING
+    A peered with B, B peered with C ≠ A can reach C
+    Must create direct peering A-C if needed
+    With 10 VPCs: 10*(10-1)/2 = 45 peering connections needed!
+
+Setup steps:
+  1. Requester VPC initiates peering request
+  2. Accepter VPC accepts the request
+  3. Both VPCs update their route tables (manual step — common mistake)
+  4. Security groups updated to allow traffic from peer CIDR
+
+Requirements:
+  CIDRs must NOT overlap
+  One peering connection per VPC pair
+  Cannot peer with VPCs that have matching CIDRs
+```
+
+```bash
+# Step 1: Create peering connection (from VPC A)
+aws ec2 create-vpc-peering-connection \
+  --vpc-id vpc-aaaa1111 \
+  --peer-vpc-id vpc-bbbb2222 \
+  --peer-region ap-south-1 \
+  --peer-owner-id 222222222222
+
+# Step 2: Accept peering (in VPC B account)
+aws ec2 accept-vpc-peering-connection \
+  --vpc-peering-connection-id pcx-12345678
+
+# Step 3: Update route table in VPC A — route VPC B traffic via peering
+aws ec2 create-route \
+  --route-table-id rtb-vpc-a \
+  --destination-cidr-block 10.1.0.0/16 \
+  --vpc-peering-connection-id pcx-12345678
+
+# Step 4: Update route table in VPC B — route VPC A traffic via peering
+aws ec2 create-route \
+  --route-table-id rtb-vpc-b \
+  --destination-cidr-block 10.0.0.0/16 \
+  --vpc-peering-connection-id pcx-12345678
+
+# Verify peering is active
+aws ec2 describe-vpc-peering-connections \
+  --filters Name=status-code,Values=active
+```
+
+---
+
+### Transit Gateway (TGW)
+
+```
+Transit Gateway = central network hub connecting VPCs, VPNs, Direct Connect
+  Solves the "N*(N-1)/2" peering problem
+  Transitive routing: any attachment can reach any other attachment
+  Regional (one per region) — can peer TGWs across regions
+
+Attachments:
+  VPC: attach your VPCs (each costs $0.05/hr)
+  VPN: connect on-premises via Site-to-Site VPN
+  Direct Connect Gateway: connect on-premises via Direct Connect
+  Peering: connect to TGW in another region
+  
+TGW Route Tables:
+  TGW has its own route tables (separate from VPC route tables)
+  Control which attachments can talk to which
+  Isolation: prod VPCs in one route table, dev in another → no cross-talk
+  
+  Example: hub-spoke
+    Spoke VPCs: each only routes to TGW (not to each other directly)
+    TGW routes: propagated from VPC attachments
+    Shared services VPC: accessible to all spokes via TGW
+
+TGW vs VPC Peering:
+  VPC Peering: free (pay only data transfer), no transitive routing, complex at scale
+  TGW:         $0.05/hr per attachment + $0.02/GB, transitive, simpler at scale
+  Use peering for ≤3 VPCs, TGW for 4+ or mixed connectivity
+```
+
+```bash
+# Create Transit Gateway
+aws ec2 create-transit-gateway \
+  --description "judicial-prod-tgw" \
+  --options '
+    AmazonSideAsn=64512,
+    AutoAcceptSharedAttachments=disable,
+    DefaultRouteTableAssociation=enable,
+    DefaultRouteTablePropagation=enable,
+    VpnEcmpSupport=enable,
+    DnsSupport=enable
+  ' \
+  --tag-specifications 'ResourceType=transit-gateway,Tags=[{Key=Name,Value=judicial-tgw}]'
+
+# Attach VPC to TGW
+aws ec2 create-transit-gateway-vpc-attachment \
+  --transit-gateway-id tgw-12345678 \
+  --vpc-id vpc-aaaa1111 \
+  --subnet-ids subnet-1a subnet-1b \
+  --tag-specifications 'ResourceType=transit-gateway-attachment,Tags=[{Key=Name,Value=prod-vpc-attachment}]'
+
+# Update VPC route table to use TGW for traffic to other VPCs
+aws ec2 create-route \
+  --route-table-id rtb-vpc-a-private \
+  --destination-cidr-block 10.0.0.0/8 \
+  --transit-gateway-id tgw-12345678
+
+# List all TGW attachments
+aws ec2 describe-transit-gateway-attachments \
+  --filters Name=transit-gateway-id,Values=tgw-12345678
+```
+
+---
+
+### Site-to-Site VPN
+
+```
+Site-to-Site VPN = encrypted IPsec tunnel between on-premises and AWS
+
+Components:
+  Virtual Private Gateway (VGW):
+    AWS side of the VPN tunnel
+    Attached to your VPC
+    AWS-managed, highly available
+
+  Customer Gateway (CGW):
+    Represents your on-premises router in AWS
+    Configuration object (stores router's public IP and BGP ASN)
+    The actual device is your router/firewall
+
+  VPN Connection:
+    The tunnel between VGW and CGW
+    Always creates TWO tunnels (different AZs for redundancy)
+    Each tunnel: one public IP on AWS side, one on your side
+    If one tunnel fails → traffic fails over to second
+
+Routing options:
+  Static routing: manually enter on-premises CIDRs in AWS
+  Dynamic (BGP): routers exchange routes automatically
+                 Better for complex networks, automatic failover
+                 Requires BGP ASN on both sides
+
+Key facts:
+  Bandwidth: up to 1.25 Gbps per tunnel
+  Latency: internet-dependent (varies)
+  Cost: $0.05/hr per VPN connection + data transfer
+  Encryption: AES-256, IKEv1/IKEv2
+  Use case: secure connectivity to AWS, backup for Direct Connect
+
+Monitoring:
+  TunnelState metric in CloudWatch (0=down, 1=up)
+  Alert when tunnel goes down
+```
+
+```bash
+# Create Customer Gateway (your on-premises router)
+aws ec2 create-customer-gateway \
+  --type ipsec.1 \
+  --public-ip 203.0.113.1 \
+  --bgp-asn 65000 \
+  --tag-specifications 'ResourceType=customer-gateway,Tags=[{Key=Name,Value=office-router}]'
+
+# Create Virtual Private Gateway
+aws ec2 create-vpn-gateway \
+  --type ipsec.1 \
+  --amazon-side-asn 64512 \
+  --tag-specifications 'ResourceType=vpn-gateway,Tags=[{Key=Name,Value=judicial-vgw}]'
+
+# Attach VGW to VPC
+aws ec2 attach-vpn-gateway \
+  --vpn-gateway-id vgw-12345678 \
+  --vpc-id vpc-12345678
+
+# Create VPN connection
+aws ec2 create-vpn-connection \
+  --type ipsec.1 \
+  --customer-gateway-id cgw-12345678 \
+  --vpn-gateway-id vgw-12345678 \
+  --options '{"StaticRoutesOnly":false}' \
+  --tag-specifications 'ResourceType=vpn-connection,Tags=[{Key=Name,Value=office-to-aws}]'
+
+# Download VPN configuration (for your router brand)
+aws ec2 describe-vpn-connections \
+  --vpn-connection-ids vpn-12345678 \
+  --query 'VpnConnections[0].CustomerGatewayConfiguration'
+
+# Enable route propagation (VGW automatically adds on-prem routes)
+aws ec2 enable-vgw-route-propagation \
+  --route-table-id rtb-12345678 \
+  --gateway-id vgw-12345678
+```
+
+---
+
+### Direct Connect
+
+```
+Direct Connect = dedicated physical connection from on-premises to AWS
+  NOT over public internet — dedicated leased line
+  Consistent, reliable, lower latency than VPN
+  Speeds: 50 Mbps to 100 Gbps
+
+Types:
+  Dedicated Connection:
+    Physical port at Direct Connect location
+    1, 10, or 100 Gbps
+    Takes weeks to provision (physical work)
+    
+  Hosted Connection:
+    Via AWS Direct Connect Partner (Tata, Airtel, BSNL, etc.)
+    50 Mbps to 10 Gbps
+    Faster provisioning than dedicated
+    Shared physical connection
+
+Key concepts:
+  Virtual Interface (VIF): logical connection over Direct Connect
+    Private VIF: connects to a single VPC via VGW
+    Public VIF:  connects to AWS public services (S3, DynamoDB, public IPs)
+    Transit VIF: connects to Transit Gateway (up to 3 TGW attachments)
+
+  Direct Connect Gateway:
+    Connect ONE Direct Connect to MULTIPLE VPCs (in same or different regions)
+    Without DXGW: need one VIF per VPC
+    With DXGW:    one VIF → DXGW → multiple VGW/TGW
+
+  Link Aggregation Group (LAG):
+    Bundle multiple Direct Connect ports for higher bandwidth
+    2 × 10 Gbps LAG = 20 Gbps effective bandwidth
+    Still single physical location — not fully redundant
+
+Benefits vs VPN:
+  More consistent bandwidth (dedicated, not shared internet)
+  Lower latency (more predictable)
+  Reduced data transfer costs (lower than internet egress)
+  Compliance: data doesn't traverse public internet
+
+Limitations:
+  NOT encrypted by default
+  Solution: run IPsec VPN over Direct Connect (encryption + dedicated bandwidth)
+  NOT instant: weeks to provision dedicated port
+  NOT redundant by itself: need two connections at two locations for true HA
+
+HA architecture:
+  Location A: Direct Connect connection 1
+  Location B: Direct Connect connection 2 (different facility)
+  Backup: Site-to-Site VPN (activate if both DX connections fail)
+```
+
+---
+
+### VPN CloudHub
+
+```
+VPN CloudHub = hub-and-spoke connectivity between multiple sites via AWS
+
+Use case:
+  Multiple office/branch locations need to communicate
+  All connect to same AWS Virtual Private Gateway via VPN
+  Offices can communicate through AWS as hub
+  Can also access resources in the attached VPC
+
+Setup:
+  Each site: Customer Gateway + VPN connection to same VGW
+  VGW becomes the hub
+  Dynamic routing (BGP) enables offices to discover each other's routes
+
+Traffic flow:
+  Mumbai office → VPN → VGW → VPN → Singapore office
+                              ↓
+                          VPC resources
+
+Requirements:
+  BGP must be configured on all Customer Gateways
+  Each site must have a unique BGP ASN
+  Each site must have non-overlapping IP ranges
+
+Cost:
+  Each VPN connection: $0.05/hr
+  Data transfer between sites: standard data transfer rates
+  No additional CloudHub fee
+
+Not to confuse with:
+  Transit Gateway: more powerful, supports more connection types, higher scale
+  CloudHub is older pattern — for simpler multi-site VPN needs
+  TGW preferred for new deployments
+```
+
+---
+
+### AWS PrivateLink & VPC Endpoints
+
+```
+Problem without endpoints:
+  EC2 in private subnet → wants to call S3 API
+  Traffic goes: private subnet → NAT Gateway → Internet → S3
+  Costs: NAT GW processing fee + data transfer
+  Risk: data traverses public internet
+
+Solution: VPC Endpoints
+  Private connection between VPC and AWS services
+  Traffic stays within AWS network (never touches internet)
+  No NAT Gateway, no IGW needed for these services
+  Free to use (except Interface endpoints which have hourly cost)
+
+Two types:
+
+1. Gateway Endpoint (FREE):
+   Services: S3 and DynamoDB ONLY
+   Added as entry in route table (not an ENI)
+   Traffic automatically routed through endpoint
+   
+   aws ec2 create-vpc-endpoint \
+     --vpc-id vpc-12345678 \
+     --service-name com.amazonaws.ap-south-1.s3 \
+     --route-table-ids rtb-private-1a rtb-private-1b
+
+2. Interface Endpoint (costs $0.01/hr/AZ + data):
+   Most other AWS services (SSM, Secrets Manager, ECR, CloudWatch, etc.)
+   Creates an ENI with private IP in your subnet
+   DNS: AWS automatically resolves service hostname to private IP
+   
+   Popular interface endpoints:
+     com.amazonaws.region.ssm             (Systems Manager)
+     com.amazonaws.region.secretsmanager  (Secrets Manager)
+     com.amazonaws.region.ecr.api         (ECR API)
+     com.amazonaws.region.ecr.dkr         (ECR Docker)
+     com.amazonaws.region.logs            (CloudWatch Logs)
+     com.amazonaws.region.monitoring      (CloudWatch Metrics)
+     com.amazonaws.region.execute-api     (API Gateway)
+     com.amazonaws.region.sts             (STS)
+
+AWS PrivateLink:
+  Expose YOUR service to other VPCs privately
+  You: create NLB → create endpoint service
+  Consumer: creates Interface VPC Endpoint → gets private IP in their VPC
+  Traffic never leaves AWS network
+  Works cross-account and cross-region
+  
+  Use cases:
+    SaaS: expose your service to customers without public internet
+    Internal platform teams: share services across accounts
+    Eliminate VPC peering complexity for service-specific access
+```
+
+```bash
+# Create S3 Gateway Endpoint (free)
+aws ec2 create-vpc-endpoint \
+  --vpc-id vpc-12345678 \
+  --vpc-endpoint-type Gateway \
+  --service-name com.amazonaws.ap-south-1.s3 \
+  --route-table-ids rtb-private-1a rtb-private-1b \
+  --tag-specifications 'ResourceType=vpc-endpoint,Tags=[{Key=Name,Value=s3-endpoint}]'
+
+# Create DynamoDB Gateway Endpoint (free)
+aws ec2 create-vpc-endpoint \
+  --vpc-id vpc-12345678 \
+  --vpc-endpoint-type Gateway \
+  --service-name com.amazonaws.ap-south-1.dynamodb \
+  --route-table-ids rtb-private-1a rtb-private-1b
+
+# Create Interface Endpoint for Secrets Manager
+aws ec2 create-vpc-endpoint \
+  --vpc-id vpc-12345678 \
+  --vpc-endpoint-type Interface \
+  --service-name com.amazonaws.ap-south-1.secretsmanager \
+  --subnet-ids subnet-private-1a subnet-private-1b \
+  --security-group-ids sg-endpoint \
+  --private-dns-enabled  # so existing SDK calls work without code change
+
+# Endpoint policy (restrict which resources can be accessed via endpoint)
+aws ec2 modify-vpc-endpoint \
+  --vpc-endpoint-id vpce-12345678 \
+  --policy-document '{
+    "Statement": [{
+      "Effect": "Allow",
+      "Principal": "*",
+      "Action": "s3:*",
+      "Resource": [
+        "arn:aws:s3:::judicial-prod-bucket",
+        "arn:aws:s3:::judicial-prod-bucket/*"
+      ]
+    }]
+  }'
+
+# List all endpoints in VPC
+aws ec2 describe-vpc-endpoints \
+  --filters Name=vpc-id,Values=vpc-12345678 \
+  --query 'VpcEndpoints[*].[VpcEndpointId,ServiceName,State]' \
+  --output table
+```
+
+---
+
+### VPC Flow Logs
+
+```
+VPC Flow Logs = capture network traffic metadata for your VPC
+  NOT packet capture (no payload) — only metadata
+  Records: source IP, destination IP, port, protocol, bytes, action (ACCEPT/REJECT)
+  
+Capture levels:
+  VPC level:    all traffic across all ENIs in VPC
+  Subnet level: all traffic in specific subnet
+  ENI level:    specific network interface
+
+Destinations:
+  CloudWatch Logs: queryable via Logs Insights
+  S3:             queryable via Athena (cheaper for long-term)
+  Kinesis Data Firehose: real-time streaming to OpenSearch/S3
+
+Flow log format (default):
+  version account-id interface-id srcaddr dstaddr srcport dstport protocol packets bytes start end action log-status
+
+  Example (REJECTED):
+  2 123456789012 eni-abc123 10.0.1.5 10.0.2.100 54321 22 6 1 52 1679500000 1679500060 REJECT OK
+
+Custom format (choose fields):
+  ${srcaddr} ${dstaddr} ${srcport} ${dstport} ${protocol} ${action} ${bytes}
+
+Use cases:
+  Security: detect port scanning, unauthorized access attempts
+  Troubleshooting: "why can't EC2 reach RDS?" → check flow logs for REJECT
+  Compliance: audit all network traffic
+  Cost: identify unexpected data transfer
+
+Troubleshooting with flow logs:
+  ACCEPT: traffic was allowed by SG/NACL
+  REJECT: traffic was blocked by SG/NACL
+  No record: traffic never reached the ENI (routing issue)
+```
+
+```bash
+# Enable flow logs → CloudWatch Logs
+aws ec2 create-flow-logs \
+  --resource-type VPC \
+  --resource-ids vpc-12345678 \
+  --traffic-type ALL \
+  --log-destination-type cloud-watch-logs \
+  --log-group-name /judicial/vpc-flow-logs \
+  --deliver-logs-permission-arn arn:aws:iam::ACCOUNT:role/flow-logs-role
+
+# Enable flow logs → S3 (cheaper for large volumes)
+aws ec2 create-flow-logs \
+  --resource-type VPC \
+  --resource-ids vpc-12345678 \
+  --traffic-type ALL \
+  --log-destination-type s3 \
+  --log-destination arn:aws:s3:::judicial-logs/vpc-flow-logs/ \
+  --log-format '${srcaddr} ${dstaddr} ${srcport} ${dstport} ${protocol} ${action} ${bytes} ${start} ${end}'
+
+# Query flow logs in CloudWatch Logs Insights
+# Find rejected connections to RDS port 5432
+fields srcAddr, dstAddr, dstPort, action
+| filter dstPort = 5432 and action = "REJECT"
+| stats count(*) by srcAddr, dstAddr
+| sort count desc
+
+# Query flow logs in Athena (S3 destination)
+# Create table first, then:
+SELECT srcaddr, dstaddr, dstport, action, bytes
+FROM vpc_flow_logs
+WHERE action = 'REJECT'
+  AND dstport = 5432
+  AND day = '2024-03-22'
+ORDER BY bytes DESC
+LIMIT 50;
+```
+
+---
+
+### Traffic Mirroring
+
+```
+Traffic Mirroring = copy actual network packets from ENI to monitoring tools
+  Unlike Flow Logs (metadata only) — captures FULL PACKET PAYLOAD
+  Source: ENI to mirror (your EC2, EKS node, etc.)
+  Target: another ENI or NLB (your monitoring/analysis tool)
+  Filter: specify which traffic to mirror (all, or specific ports/IPs)
+
+Use cases:
+  Security: IDS/IPS (Intrusion Detection/Prevention) — catch attacks
+  Compliance: deep packet inspection for regulatory requirements
+  Troubleshooting: see exact traffic content between services
+  Performance analysis: application-level latency analysis
+
+Limitations:
+  Additional bandwidth cost (mirrored traffic = extra data)
+  Instance must support Enhanced Networking (nitro-based)
+  Cannot mirror from some instance types
+  Within same VPC or across VPC (via peering)
+
+Setup:
+  1. Mirror source: ENI you want to monitor
+  2. Mirror target: ENI of your monitoring tool
+  3. Mirror filter: what to capture (all TCP, specific ports, etc.)
+  4. Mirror session: connects source + target + filter
+```
+
+```bash
+# Create mirror target (your monitoring tool's ENI)
+aws ec2 create-traffic-mirror-target \
+  --network-interface-id eni-monitor-tool \
+  --description "IDS monitoring tool"
+
+# Create mirror filter (what to capture)
+aws ec2 create-traffic-mirror-filter \
+  --description "capture all traffic"
+
+# Add filter rule: capture inbound TCP
+aws ec2 create-traffic-mirror-filter-rule \
+  --traffic-mirror-filter-id tmf-12345678 \
+  --traffic-direction ingress \
+  --rule-number 100 \
+  --rule-action accept \
+  --protocol 6 \
+  --destination-cidr-block 0.0.0.0/0 \
+  --source-cidr-block 0.0.0.0/0
+
+# Create mirror session (source → target using filter)
+aws ec2 create-traffic-mirror-session \
+  --network-interface-id eni-source-ec2 \
+  --traffic-mirror-target-id tmt-12345678 \
+  --traffic-mirror-filter-id tmf-12345678 \
+  --session-number 1 \
+  --description "Mirror production API traffic to IDS"
+```
+
+---
+
+### Egress-Only Internet Gateway
+
+```
+Egress-Only Internet Gateway = NAT Gateway for IPv6
+  Allows IPv6 instances in VPC to initiate connections to internet
+  BLOCKS all inbound connections from internet (egress-only)
+  Required because IPv6 addresses are public by default (no NAT)
+
+Why needed:
+  IPv4: private instances use NAT GW (private IP → public IP)
+        Works because IPv4 has public/private distinction
+  
+  IPv6: ALL IPv6 addresses are public (no private range like 10.x.x.x)
+        Without egress-only GW: IPv6 instances are fully internet-accessible
+        With egress-only GW: can call internet but internet can't initiate connection
+
+Key facts:
+  Free (like regular IGW)
+  Only for IPv6 (not IPv4)
+  One per VPC
+  Stateful (like SG — return traffic allowed automatically)
+
+Route table entry:
+  Destination: ::/0 (all IPv6)
+  Target:      eigw-12345678
+
+Compared to regular IGW:
+  IGW:             allows both inbound AND outbound IPv6
+  Egress-only IGW: allows OUTBOUND ONLY (internet can't initiate connection)
+```
+
+```bash
+# Create Egress-Only Internet Gateway
+aws ec2 create-egress-only-internet-gateway \
+  --vpc-id vpc-12345678 \
+  --tag-specifications 'ResourceType=egress-only-internet-gateway,Tags=[{Key=Name,Value=judicial-eigw}]'
+
+# Add to route table (for private subnets with IPv6)
+aws ec2 create-route \
+  --route-table-id rtb-private-1a \
+  --destination-ipv6-cidr-block ::/0 \
+  --egress-only-internet-gateway-id eigw-12345678
+
+# Assign IPv6 CIDR to VPC (required first)
+aws ec2 associate-vpc-cidr-block \
+  --vpc-id vpc-12345678 \
+  --amazon-provided-ipv6-cidr-block
+
+# Assign IPv6 CIDR to subnet
+aws ec2 associate-subnet-cidr-block \
+  --subnet-id subnet-private-1a \
+  --ipv6-cidr-block 2600:1f14:xxx::/64
+```
+
+---
+
+### Networking Comparison Table
+
+```
+┌────────────────────────────┬────────────────┬─────────────┬────────────────────────────────┐
+│ Component                  │ Direction      │ Cost        │ Use For                        │
+├────────────────────────────┼────────────────┼─────────────┼────────────────────────────────┤
+│ Internet Gateway (IGW)     │ Bi-directional │ Free        │ Public subnets ↔ Internet      │
+│ NAT Gateway                │ Outbound only  │ $0.045/hr   │ Private subnets → Internet     │
+│ Egress-Only IGW            │ Outbound only  │ Free        │ Private IPv6 → Internet        │
+│ VPC Peering                │ Bi-directional │ Data only   │ 2-3 VPCs, no transitive needed │
+│ Transit Gateway            │ Bi-directional │ $0.05/hr/att│ 4+ VPCs, mixed connectivity    │
+│ Site-to-Site VPN           │ Bi-directional │ $0.05/hr    │ On-prem ↔ AWS (encrypted)      │
+│ Direct Connect             │ Bi-directional │ Port hours  │ Dedicated on-prem ↔ AWS line   │
+│ VPN CloudHub               │ Bi-directional │ VPN costs   │ Multiple offices via AWS hub   │
+│ Gateway Endpoint (S3/DDB)  │ Outbound       │ Free        │ Private S3/DynamoDB access     │
+│ Interface Endpoint         │ Bi-directional │ $0.01/hr/AZ │ Private access to AWS services │
+│ PrivateLink                │ Consumer only  │ $0.01/hr/AZ │ Expose service to other VPCs   │
+│ VPC Flow Logs              │ N/A (logging)  │ Storage cost│ Network audit and troubleshoot │
+│ Traffic Mirroring          │ N/A (copy)     │ Bandwidth   │ Deep packet inspection / IDS   │
+└────────────────────────────┴────────────────┴─────────────┴────────────────────────────────┘
+```
+
+### When to Use Which — Quick Decision
+
+```
+Need internet access for PUBLIC resources?
+  → Internet Gateway (IGW)
+
+Private resources need to call internet (yum update, pip, APIs)?
+  → NAT Gateway (in same AZ as private subnet for HA)
+
+Private IPv6 resources need outbound internet?
+  → Egress-Only Internet Gateway
+
+Connect to S3 or DynamoDB without internet?
+  → Gateway VPC Endpoint (free, no code change needed)
+
+Private access to other AWS services (SSM, Secrets Manager, ECR)?
+  → Interface VPC Endpoint
+
+Connect on-premises to AWS securely?
+  → Site-to-Site VPN (quick, affordable) 
+  → OR Direct Connect (dedicated, consistent, for heavy traffic)
+
+Connect multiple offices to AWS AND to each other?
+  → VPN CloudHub
+
+Connect 2-3 VPCs?
+  → VPC Peering (free, simple)
+
+Connect 4+ VPCs or mixed VPC+VPN+Direct Connect?
+  → Transit Gateway
+
+Expose your service privately to other AWS accounts?
+  → AWS PrivateLink
+
+Need full network traffic capture for security/compliance?
+  → Traffic Mirroring
+
+Need network metadata for troubleshooting/audit?
+  → VPC Flow Logs
+```
+
+---
+
+### VPC Interview Questions
+
+**Q: Walk me through the components needed for an EC2 in a private subnet to call an S3 API.**
+
+```
+Route: EC2 (private subnet) → NAT Gateway (public subnet) → IGW → Internet → S3
+
+Required components:
+  1. VPC with DNS hostnames enabled
+  2. Public subnet with IGW attached via route table (0.0.0.0/0 → IGW)
+  3. Elastic IP allocated + NAT Gateway deployed in public subnet
+  4. Private subnet route table: 0.0.0.0/0 → NAT GW
+  5. Security Group: allow outbound 443 from EC2
+  6. IAM role attached to EC2 with S3 permissions
+
+Better approach (cheaper + more secure):
+  Replace NAT GW → S3 Gateway Endpoint
+  Traffic stays within AWS (no internet)
+  Free (no NAT GW charges)
+  Add endpoint to private route table
+  0.0.0.0/0 → NAT GW (still needed for other internet traffic)
+  S3 CIDR → S3 Gateway Endpoint (automatically managed by AWS)
+```
+
+**Q: A security team asks you to capture all traffic between your web tier and app tier for analysis. How do you implement this?**
+
+```
+Two options:
+
+Option 1: VPC Flow Logs (metadata only, free)
+  Enable Flow Logs on private subnet at ENI level
+  Capture: source/dest IPs, ports, protocol, bytes, ACCEPT/REJECT
+  Cannot see: actual data payload
+  Good for: threat detection, troubleshooting, compliance logging
+  Store in: CloudWatch Logs (query with Logs Insights) or S3 (Athena)
+
+Option 2: Traffic Mirroring (full packets, additional cost)
+  Mirror source ENI (web tier instances)
+  Mirror target: security monitoring tool ENI (e.g. Suricata IDS)
+  Filter: only TCP 8080 (app tier port)
+  Can see: actual HTTP request/response payloads
+  Good for: IDS/IPS, deep security inspection, compliance requiring full capture
+
+Choose:
+  Flow Logs → general monitoring, troubleshooting, SIEM integration
+  Traffic Mirroring → full packet capture, IDS requirements, DLP
+```
+
+**Q: Your application in VPC A needs to access a database in VPC B (different account). What are your options?**
+
+```
+Option 1: VPC Peering (simplest)
+  Create peering connection between VPC A and VPC B
+  Update BOTH route tables
+  Update security group in VPC B to allow from VPC A CIDR
+  Works if CIDRs don't overlap
+  No transitive routing (if VPC B can reach VPC C, VPC A cannot)
+
+Option 2: AWS PrivateLink (most secure)
+  VPC B: put DB behind NLB, create endpoint service
+  VPC A: create interface endpoint pointing to VPC B's service
+  VPC A app calls endpoint IP → PrivateLink → VPC B NLB → DB
+  No need to expose VPC B CIDR to VPC A
+  Works even with overlapping CIDRs
+
+Option 3: Transit Gateway
+  Overkill for just 2 VPCs but useful if you have many VPCs
+  Attach both VPCs to TGW, route tables allow communication
+
+Choose:
+  2 VPCs, simple → Peering (free, easy)
+  Security-sensitive, overlapping CIDRs possible → PrivateLink
+  Many VPCs already using TGW → add to TGW
+```
+
+**Q: What happens if a NAT Gateway AZ goes down?**
+
+```
+Single NAT Gateway (bad design):
+  All private subnets across all AZs route through one NAT GW
+  NAT GW AZ fails → private subnets in ALL AZs lose internet
+  Single point of failure
+
+HA NAT Gateway design:
+  One NAT GW per AZ (e.g., nat-gw-1a, nat-gw-1b, nat-gw-1c)
+  Each AZ's private subnet routes to its own NAT GW
+  AZ-1a fails → only private subnet in AZ-1a loses internet
+  Other AZs unaffected
+
+Terraform for HA NAT:
+  resource "aws_nat_gateway" "main" {
+    for_each      = aws_subnet.public      # one per public subnet (per AZ)
+    subnet_id     = each.value.id
+    allocation_id = aws_eip.nat[each.key].id
+  }
+  
+  resource "aws_route" "private_nat" {
+    for_each               = aws_route_table.private  # one RT per AZ
+    route_table_id         = each.value.id
+    destination_cidr_block = "0.0.0.0/0"
+    nat_gateway_id         = aws_nat_gateway.main[each.key].id
+  }
+  # Result: private-rt-1a → nat-1a, private-rt-1b → nat-1b
+```
+
+**Q: How do VPC Flow Logs help you troubleshoot connectivity issues?**
+
+```
+Scenario: App server can't connect to RDS on port 5432
+
+Step 1: Check flow logs for the RDS ENI
+  Filter: dstPort = 5432, srcAddr = app-server-IP
+  
+  If REJECT: Security Group or NACL is blocking
+    Check: RDS SG inbound rules (is app SG allowed?)
+    Check: Subnet NACL (are ports 5432 and ephemeral 1024-65535 allowed?)
+  
+  If no record: routing issue (packet never reached RDS ENI)
+    Check: route table in app subnet
+    Check: VPC peering connection if in different VPC
+    Check: correct subnet/AZ for RDS
+
+  If ACCEPT: packet reached RDS but connection still fails
+    → Application-level issue (auth, TLS, DB user permissions)
+    → Not a network issue — look at DB logs
+
+Common patterns in flow logs:
+  Many REJECT from same IP → potential port scan / attack
+  Unexpected traffic on unusual ports → investigate security
+  High bytes to external IP → potential data exfiltration
+  ACCEPT then no response → asymmetric routing issue
 ```
