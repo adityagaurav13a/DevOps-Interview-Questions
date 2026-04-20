@@ -3493,3 +3493,935 @@ Common patterns in flow logs:
   High bytes to external IP → potential data exfiltration
   ACCEPT then no response → asymmetric routing issue
 ```
+
+
+---
+
+## PART 15 — SYSTEMS MANAGER (SSM)
+
+### Why SSM Matters for DevOps
+
+```
+Old way (everyone used to do this):
+  EC2 in private subnet → need to access it
+  Open port 22 → create bastion host → SSH → done
+  
+  Problems:
+    Port 22 open = attack surface
+    Bastion host = another server to maintain, patch, secure
+    SSH keys to manage and rotate
+    No audit trail of what commands were run
+    
+SSM Way (modern, correct):
+  No port 22 needed (security group: no inbound SSH)
+  No bastion host (saves cost + complexity)
+  Access via AWS console or CLI
+  Every session recorded to CloudWatch/S3
+  IAM controls who can access which instance
+  Works even for instances with no public IP
+```
+
+### SSM Session Manager
+
+```
+How it works:
+  SSM Agent (pre-installed on Amazon Linux 2, Ubuntu, Windows)
+  Agent makes OUTBOUND connection to SSM endpoint (port 443)
+  You connect IN through AWS API (not SSH)
+  Traffic goes: Your laptop → AWS API → SSM endpoint → Agent → EC2
+  
+  Security group: NO inbound rules needed at all
+  
+Start session:
+  # Via CLI
+  aws ssm start-session --target i-1234567890
+  # Opens a shell inside the EC2 (like SSH but through AWS)
+  
+  # Or via AWS Console:
+  EC2 → Select instance → Connect → Session Manager → Connect
+
+Requirements:
+  EC2 must have: SSM Agent installed (Amazon Linux 2 has it by default)
+  EC2 must have: IAM role with AmazonSSMManagedInstanceCore policy
+  EC2 must have: outbound 443 to ssm endpoints (or VPC endpoints for SSM)
+
+Session logging:
+  All commands + output → CloudWatch Logs group
+  All sessions → S3 bucket
+  CloudTrail: records who started session, when, duration
+  
+  aws ssm describe-sessions --state Active
+  aws ssm describe-sessions --state History
+
+Port forwarding (replace SSH tunnels):
+  # Access RDS in private subnet from your laptop
+  aws ssm start-session \
+    --target i-1234567890 \
+    --document-name AWS-StartPortForwardingSessionToRemoteHost \
+    --parameters '{"host":["mydb.xxx.rds.amazonaws.com"],
+                   "portNumber":["5432"],
+                   "localPortNumber":["5432"]}'
+  
+  # Now: psql -h localhost -p 5432 -U admin mydb
+  # Traffic: laptop → SSM → EC2 → RDS (all private)
+```
+
+### SSM Parameter Store
+
+```
+Store configuration values securely — accessed by apps at runtime
+
+Types:
+  String:       plain text (DB_HOST, LOG_LEVEL, ENVIRONMENT)
+  StringList:   comma-separated values (allowed_ips=1.2.3.4,5.6.7.8)
+  SecureString: encrypted with KMS (DB_PASSWORD, API_KEY)
+
+Tiers:
+  Standard: free, 4KB limit, 10,000 parameters
+  Advanced:  $0.05/month per parameter, 8KB, policies (TTL, expiry)
+
+Path structure (use hierarchical naming):
+  /judicial/dev/db_host
+  /judicial/dev/db_password
+  /judicial/prod/db_host
+  /judicial/prod/db_password
+  
+  Get all prod parameters at once:
+  aws ssm get-parameters-by-path \
+    --path /judicial/prod \
+    --with-decryption \
+    --recursive
+
+CLI commands:
+  # Write
+  aws ssm put-parameter \
+    --name /judicial/prod/db_host \
+    --value "judicial.xxx.ap-south-1.rds.amazonaws.com" \
+    --type String
+  
+  aws ssm put-parameter \
+    --name /judicial/prod/db_password \
+    --value "MyStr0ngP@ss" \
+    --type SecureString \
+    --key-id alias/judicial-kms-key
+  
+  # Read
+  aws ssm get-parameter \
+    --name /judicial/prod/db_password \
+    --with-decryption \
+    --query Parameter.Value \
+    --output text
+  
+  # Get multiple
+  aws ssm get-parameters \
+    --names /judicial/prod/db_host /judicial/prod/db_password \
+    --with-decryption
+
+In Lambda / ECS:
+  # Lambda env var from Parameter Store (via SAM/CloudFormation)
+  Environment:
+    Variables:
+      DB_HOST: '{{resolve:ssm:/judicial/prod/db_host}}'
+  
+  # Or read in code:
+  import boto3
+  ssm = boto3.client('ssm')
+  param = ssm.get_parameter(Name='/judicial/prod/db_host', WithDecryption=True)
+  db_host = param['Parameter']['Value']
+```
+
+### Parameter Store vs Secrets Manager
+
+```
+Parameter Store (SSM):
+  Cost:       FREE for standard tier
+  Encryption: Optional (SecureString with KMS)
+  Rotation:   Manual only — you update it yourself
+  Limit:      4KB per value
+  Use for:    DB hostnames, feature flags, config values,
+              non-sensitive settings, large number of params
+  
+Secrets Manager:
+  Cost:       $0.40/secret/month + $0.05 per 10K API calls
+  Encryption: Always encrypted
+  Rotation:   AUTOMATIC — built-in rotation for RDS, custom Lambda
+              DB password changed automatically every 30 days
+              App reads new password automatically — zero downtime
+  Limit:      64KB per secret
+  Use for:    Passwords, API keys, certificates — anything that
+              needs automatic rotation
+
+Decision rule:
+  Needs auto-rotation?       → Secrets Manager
+  DB password, API key?      → Secrets Manager
+  Feature flag, config?      → Parameter Store (free)
+  More than 100 parameters?  → Parameter Store (Secrets Manager gets expensive)
+  Accessed by 10+ services?  → Parameter Store (cheaper API costs)
+```
+
+### SSM Patch Manager
+
+```
+Auto-patch EC2 instances — no manual SSH needed
+
+Patch Baseline:
+  Defines: which patches to apply
+  AWS provides defaults per OS (Amazon Linux, Ubuntu, Windows, RHEL)
+  Custom: only Critical + Important security patches
+  Never: new feature patches (too risky)
+
+Maintenance Window:
+  When to patch: every Sunday 2am-4am
+  Which instances: tag-based (Environment=production)
+  Max concurrent: 20% of fleet at a time
+  Error threshold: stop if >5% fail
+  
+  aws ssm create-maintenance-window \
+    --name "sunday-patching" \
+    --schedule "cron(0 2 ? * SUN *)" \
+    --duration 2 \
+    --cutoff 1
+
+Patch compliance report:
+  aws ssm describe-instance-patch-states \
+    --instance-ids i-1234567890
+  # Shows: patch state, missing patches, installed patches
+
+Interview answer: "How do you patch 100 EC2s?"
+  "SSM Patch Manager with maintenance windows.
+   Define patch baseline (security only),
+   tag instances, create maintenance window.
+   Patches applied automatically every Sunday 2am.
+   Compliance report in SSM console — no SSH needed."
+```
+
+### SSM Run Command
+
+```
+Execute commands on multiple EC2s simultaneously — no SSH
+
+# Run command on ALL instances tagged Environment=production
+aws ssm send-command \
+  --document-name "AWS-RunShellScript" \
+  --parameters '{"commands":["systemctl restart nginx"]}' \
+  --targets '[{"Key":"tag:Environment","Values":["production"]}]' \
+  --comment "Restart nginx after config update"
+
+# Check results
+aws ssm list-command-invocations \
+  --command-id COMMAND_ID \
+  --details
+
+# Built-in documents:
+# AWS-RunShellScript       → run any shell command
+# AWS-UpdateSSMAgent       → update SSM agent
+# AWS-RunAnsiblePlaybook   → run Ansible without SSH
+# AWS-ConfigureAWSPackage  → install/uninstall packages
+
+Use cases:
+  Restart service on 50 instances: 10 seconds
+  Collect disk usage across fleet: instant
+  Run security remediation script everywhere
+  All without opening SSH, all logged
+```
+
+---
+
+## PART 16 — CLOUDTRAIL + AWS CONFIG
+
+### CloudTrail — The Audit Trail
+
+```
+CloudTrail records every AWS API call:
+  Who:   IAM user, role, service that made the call
+  What:  Which API action (CreateBucket, TerminateInstances, etc.)
+  When:  Timestamp
+  Where: Source IP address
+  Result: Success or error + response
+
+Default: 90 days of management events (free)
+Setup for longer: create Trail → store in S3 → query with Athena
+
+Types of events:
+  Management events: control plane (create/delete/modify resources)
+    EC2 StartInstances, S3 CreateBucket, IAM CreateUser
+    Enabled by default
+    
+  Data events: data plane (accessing data inside resources)
+    S3 GetObject, PutObject (not logged by default — high volume)
+    Lambda Invoke
+    Must explicitly enable — extra cost
+    
+  Insight events: unusual API call patterns (anomaly detection)
+    "This account is creating EC2s 10x faster than normal"
+
+Real examples:
+  "Who deleted the production S3 bucket?"
+    Athena query on CloudTrail S3 logs:
+    SELECT userIdentity.arn, eventTime, requestParameters
+    FROM cloudtrail_logs
+    WHERE eventName = 'DeleteBucket'
+    AND requestParameters LIKE '%judicial-prod%'
+    
+  "Who changed this security group at 3am?"
+    Filter: eventName = 'AuthorizeSecurityGroupIngress'
+    
+  "Which role is making the most API calls?"
+    GROUP BY userIdentity.arn, COUNT(*)
+```
+
+```bash
+# Create CloudTrail (logs to S3)
+aws cloudtrail create-trail \
+  --name judicial-audit-trail \
+  --s3-bucket-name judicial-cloudtrail-logs \
+  --is-multi-region-trail \         # capture ALL regions
+  --enable-log-file-validation      # detect tampered log files
+
+# Start logging
+aws cloudtrail start-logging --name judicial-audit-trail
+
+# Lookup specific event (last 90 days)
+aws cloudtrail lookup-events \
+  --lookup-attributes AttributeKey=EventName,AttributeValue=DeleteBucket \
+  --start-time 2024-01-01 \
+  --end-time 2024-03-31
+
+# CloudWatch Alarm for root account login (critical alert)
+# Create metric filter on CloudTrail CloudWatch Logs:
+# Filter: { $.userIdentity.type = "Root" && $.userIdentity.invokedBy NOT EXISTS }
+# Alarm: any occurrence → SNS → email/Slack immediately
+```
+
+### CloudWatch Logs Insights for CloudTrail
+
+```sql
+-- Who made the most API calls today?
+fields userIdentity.arn, eventName
+| stats count(*) as calls by userIdentity.arn
+| sort calls desc
+| limit 10
+
+-- Failed API calls (access denied)
+fields eventTime, userIdentity.arn, eventName, errorCode
+| filter errorCode = "AccessDenied"
+| sort eventTime desc
+| limit 50
+
+-- All changes to IAM (high risk)
+fields eventTime, userIdentity.arn, eventName, requestParameters
+| filter eventSource = "iam.amazonaws.com"
+  and eventName like /Create|Delete|Attach|Detach|Put/
+| sort eventTime desc
+
+-- Security group changes
+fields eventTime, userIdentity.arn, eventName, requestParameters
+| filter eventName in ["AuthorizeSecurityGroupIngress",
+                        "RevokeSecurityGroupIngress",
+                        "DeleteSecurityGroup"]
+| sort eventTime desc
+```
+
+### AWS Config — Resource Compliance
+
+```
+AWS Config answers:
+  "What did this resource look like 3 months ago?"
+  "Is every EC2 using approved AMIs?"
+  "Is every S3 bucket encrypted?"
+  "Does this RDS instance have Multi-AZ?"
+  
+Two core features:
+  1. Configuration History: timeline of every resource change
+  2. Config Rules: automated compliance checks
+
+Configuration History:
+  Config records state of every resource continuously
+  View: "On March 15, security group sg-123 had these inbound rules"
+  Timeline: see every change, who made it (links to CloudTrail)
+  
+  aws config get-resource-config-history \
+    --resource-type AWS::EC2::SecurityGroup \
+    --resource-id sg-12345678 \
+    --limit 10
+
+Config Rules — automated compliance:
+  Managed rules (AWS provides):
+    ec2-instance-no-public-ip: no EC2 should have public IP
+    s3-bucket-server-side-encryption-enabled: S3 must be encrypted
+    rds-instance-backup-enabled: RDS must have backups on
+    iam-root-access-key-check: root account has no access keys
+    restricted-ssh: no SG allows 0.0.0.0/0 on port 22
+    
+  Custom rules: Lambda function evaluates compliance
+    "All EC2s must have tag: Environment"
+    "All RDS must be in private subnets only"
+    
+  Result: COMPLIANT or NON_COMPLIANT
+  
+  Remediation: auto-fix when non-compliant
+    "S3 bucket has public access? → SSM Run Command → enable block public access"
+    "Security group has port 22 open? → Lambda → revoke the rule"
+```
+
+```bash
+# Check compliance of all resources against all rules
+aws configservice describe-compliance-by-resource \
+  --compliance-types NON_COMPLIANT
+
+# Get compliance details for specific rule
+aws configservice get-compliance-details-by-config-rule \
+  --config-rule-name restricted-ssh \
+  --compliance-types NON_COMPLIANT
+
+# Deploy AWS managed Config rules via CLI
+aws configservice put-config-rule \
+  --config-rule '{
+    "ConfigRuleName": "s3-bucket-encrypted",
+    "Source": {
+      "Owner": "AWS",
+      "SourceIdentifier": "S3_BUCKET_SERVER_SIDE_ENCRYPTION_ENABLED"
+    }
+  }'
+```
+
+### CloudTrail vs CloudWatch vs Config
+
+```
+CloudTrail:
+  WHO did WHAT to which resource and WHEN
+  API call audit log
+  Answer: "who deleted the bucket?"
+
+CloudWatch:
+  HOW is my resource PERFORMING right now
+  Metrics, logs, alarms
+  Answer: "CPU is 90%, alert the team"
+
+AWS Config:
+  WHAT does my resource LOOK LIKE and does it comply
+  Configuration state over time
+  Answer: "this S3 bucket was public on March 15"
+
+They complement each other:
+  Config detects: "S3 bucket is non-compliant (not encrypted)"
+  CloudTrail shows: "user-john made it non-compliant at 14:30"
+  CloudWatch alerts: "non-compliance alert fired, team notified"
+```
+
+---
+
+## PART 17 — KINESIS (STREAMING DATA)
+
+### What is Kinesis?
+
+```
+Kinesis = real-time data streaming platform
+  Data flows continuously, processed immediately
+  
+vs SQS (queue):
+  SQS:     one message → one consumer processes it → deleted
+  Kinesis: one record → multiple consumers can read simultaneously
+           data stays for 24 hours to 7 days (not deleted on read)
+  
+vs Kafka:
+  Kinesis:  AWS-managed, serverless option, less config
+  Kafka:    self-managed (or MSK), more control, more complex
+  MSK:      Amazon Managed Streaming for Kafka (same as Kinesis concept)
+
+When to use Kinesis:
+  Real-time analytics (process events as they happen)
+  Multiple systems consuming same data stream
+  IoT sensor data (millions of devices → one stream)
+  Clickstream analysis (user behaviour in real-time)
+  Log aggregation at massive scale
+```
+
+### Kinesis Data Streams
+
+```
+Producers write → Shards → Consumers read
+
+Shard:
+  Unit of capacity in Kinesis
+  1 shard = 1 MB/s write, 2 MB/s read, 1000 records/sec write
+  More shards = more throughput (scale by adding shards)
+  
+Record:
+  Data: your payload (up to 1MB)
+  Partition key: determines which shard it goes to
+  Sequence number: unique ID within shard
+
+Retention:
+  Default: 24 hours
+  Extended: up to 7 days (extra cost)
+  Long-term: 365 days (for compliance)
+
+Consumers:
+  Enhanced Fan-out: each consumer gets its own 2MB/s read (parallel)
+  Standard: all consumers share 2MB/s read (polling)
+  
+  AWS Lambda: trigger Lambda for each batch of records
+  Kinesis Data Analytics: SQL queries on the stream
+  Your custom app: KCL (Kinesis Client Library)
+```
+
+```bash
+# Create stream with 3 shards
+aws kinesis create-stream \
+  --stream-name judicial-events \
+  --shard-count 3
+
+# Write record to stream
+aws kinesis put-record \
+  --stream-name judicial-events \
+  --data '{"event":"case_created","case_id":"123","user":"aditya"}' \
+  --partition-key "case-123"
+
+# Put multiple records (batch)
+aws kinesis put-records \
+  --stream-name judicial-events \
+  --records '[
+    {"Data":"eyJldmVudCI6InRlc3QifQ==","PartitionKey":"key1"},
+    {"Data":"eyJldmVudCI6InRlc3QifQ==","PartitionKey":"key2"}
+  ]'
+
+# Read from stream (for testing)
+SHARD_ITERATOR=$(aws kinesis get-shard-iterator \
+  --stream-name judicial-events \
+  --shard-id shardId-000000000000 \
+  --shard-iterator-type TRIM_HORIZON \
+  --query ShardIterator --output text)
+
+aws kinesis get-records \
+  --shard-iterator $SHARD_ITERATOR \
+  --limit 10
+
+# Scale: add more shards
+aws kinesis update-shard-count \
+  --stream-name judicial-events \
+  --target-shard-count 6 \
+  --scaling-type UNIFORM_SCALING
+```
+
+### Kinesis Data Firehose
+
+```
+Firehose = simplest way to load streaming data into AWS storage
+  No shards to manage
+  Fully managed — auto-scales
+  Buffers, batches, compresses, encrypts
+  Delivers to: S3, Redshift, OpenSearch, Splunk, HTTP endpoint
+
+Perfect for: "I want all my application logs in S3 automatically"
+
+Flow:
+  Your app → Firehose → S3 (batched every 60 seconds or 5MB)
+  or
+  Kinesis Data Streams → Firehose → S3 (fan-out + storage)
+
+Buffer settings:
+  Buffer size: 5MB (deliver to S3 when buffer hits 5MB)
+  Buffer interval: 60s (deliver to S3 every 60s even if < 5MB)
+  
+  Whichever comes first triggers delivery.
+
+Data transformation:
+  Lambda: transform records before delivery
+  "Convert JSON to Parquet before storing in S3" (Athena-friendly)
+  "Add timestamp field to every record"
+  "Filter out health check events"
+
+Cost: $0.029 per GB ingested (very cheap)
+```
+
+```bash
+# Create Firehose delivery stream to S3
+aws firehose create-delivery-stream \
+  --delivery-stream-name judicial-logs \
+  --delivery-stream-type DirectPut \
+  --s3-destination-configuration '{
+    "RoleARN": "arn:aws:iam::ACCOUNT:role/firehose-role",
+    "BucketARN": "arn:aws:s3:::judicial-logs-bucket",
+    "Prefix": "logs/year=!{timestamp:yyyy}/month=!{timestamp:MM}/",
+    "ErrorOutputPrefix": "errors/",
+    "BufferingHints": {
+      "SizeInMBs": 5,
+      "IntervalInSeconds": 60
+    },
+    "CompressionFormat": "GZIP"
+  }'
+
+# Send record to Firehose
+aws firehose put-record \
+  --delivery-stream-name judicial-logs \
+  --record '{"Data":"eyJ0aW1lIjoiMTIzNDU2IiwiZXZlbnQiOiJsb2dpbiJ9"}'
+```
+
+### Kinesis Data Analytics
+
+```
+Run SQL queries on streaming data in real-time
+  No servers to manage
+  Pay per hour the application runs
+
+Use cases:
+  "Alert if error rate > 5% in last 60 seconds"
+  "Calculate average latency per endpoint every minute"
+  "Count active users in real-time"
+
+Example: real-time error rate
+  SELECT
+    eventType,
+    COUNT(*) AS total,
+    SUM(CASE WHEN status >= 500 THEN 1 ELSE 0 END) AS errors,
+    SUM(CASE WHEN status >= 500 THEN 1 ELSE 0 END) * 100.0 / COUNT(*) AS error_rate
+  FROM "judicial-events"
+  OVER TUMBLING_WINDOW(INTERVAL '1' MINUTE)
+  GROUP BY eventType
+
+Output → Lambda (trigger alert if error_rate > 5)
+      → Kinesis stream (feed into dashboard)
+      → Firehose → S3 (archive aggregated stats)
+```
+
+---
+
+## PART 18 — AWS ORGANIZATIONS + SCPs
+
+### Multi-Account Strategy
+
+```
+Why multiple accounts?
+  Single account problems:
+    Dev mistake deletes prod resource (same account = same blast radius)
+    Cost allocation impossible ("which team spent $50K?")
+    IAM complexity: thousands of users, roles, policies in one account
+    Compliance: prod data in same account as dev = audit problem
+    Security: compromised dev account → can see prod
+    
+  Multiple accounts solution:
+    Hard boundary between environments (no IAM can cross accounts without explicit trust)
+    Billing per account → cost per team/project
+    Blast radius contained (dev accident stays in dev account)
+    Compliance: prod account audited separately
+    Security: separate credential sets per environment
+
+Typical structure:
+  Management (Root) Account
+    → Billing only, AWS Organizations management
+    → No workloads ever
+    → MFA mandatory, access keys forbidden
+  
+  Security Account
+    → GuardDuty master, Security Hub aggregator
+    → CloudTrail logs from ALL accounts stored here
+    → Read-only access to other accounts for security team
+  
+  Shared Services Account
+    → ECR repositories (shared by all teams)
+    → Terraform state (S3 + DynamoDB)
+    → CI/CD runners (GitHub Actions self-hosted)
+    → Internal tooling
+  
+  Dev Account      → developers have broad access
+  Staging Account  → DevOps deploy, developers read-only
+  Prod Account     → DevOps pipeline deploy only, no human access
+  
+  Per-project isolation (large orgs):
+    judicial-dev, judicial-staging, judicial-prod (3 accounts)
+    billing-dev, billing-staging, billing-prod (3 more accounts)
+```
+
+### Service Control Policies (SCPs)
+
+```
+SCPs = guardrails applied at AWS Organizations level
+  Even account administrators CANNOT bypass SCPs
+  They set the MAXIMUM permissions anyone in the account can have
+  
+  IAM policy allows action X
+  SCP denies action X
+  → Result: DENIED (SCP wins)
+
+SCPs attach to:
+  Root: applies to ALL accounts in org
+  OU (Organizational Unit): applies to accounts in that OU
+  Individual account: applies to that account only
+
+Critical SCPs for production:
+
+1. Deny all except ap-south-1 (data residency)
+{
+  "Effect": "Deny",
+  "Action": "*",
+  "Resource": "*",
+  "Condition": {
+    "StringNotEquals": {
+      "aws:RequestedRegion": ["ap-south-1", "us-east-1"]
+    }
+  }
+}
+Note: us-east-1 needed for global services (CloudFront, IAM, Route53)
+
+2. Deny disabling CloudTrail
+{
+  "Effect": "Deny",
+  "Action": [
+    "cloudtrail:DeleteTrail",
+    "cloudtrail:StopLogging",
+    "cloudtrail:UpdateTrail"
+  ],
+  "Resource": "*"
+}
+
+3. Deny root account access keys
+{
+  "Effect": "Deny",
+  "Action": "iam:CreateAccessKey",
+  "Resource": "*",
+  "Condition": {
+    "StringEquals": {"aws:username": "root"}
+  }
+}
+
+4. Dev account: no large instances (cost protection)
+{
+  "Effect": "Deny",
+  "Action": "ec2:RunInstances",
+  "Resource": "arn:aws:ec2:*:*:instance/*",
+  "Condition": {
+    "StringNotLike": {
+      "ec2:InstanceType": [
+        "t3.*", "t4g.*", "m5.large", "m5.xlarge"
+      ]
+    }
+  }
+}
+
+5. Require MFA for sensitive operations in prod
+{
+  "Effect": "Deny",
+  "Action": [
+    "ec2:TerminateInstances",
+    "rds:DeleteDBInstance",
+    "s3:DeleteBucket"
+  ],
+  "Resource": "*",
+  "Condition": {
+    "BoolIfExists": {"aws:MultiFactorAuthPresent": "false"}
+  }
+}
+```
+
+```bash
+# Create OU structure
+aws organizations create-organizational-unit \
+  --parent-id r-xxxx \
+  --name "Production"
+
+# Create SCP
+aws organizations create-policy \
+  --content file://deny-non-approved-regions.json \
+  --description "Deny all regions except ap-south-1" \
+  --name "DenyNonApprovedRegions" \
+  --type SERVICE_CONTROL_POLICY
+
+# Attach SCP to OU
+aws organizations attach-policy \
+  --policy-id p-xxxxxxxxxxxx \
+  --target-id ou-xxxx-xxxxxxxx
+
+# List SCPs on an account
+aws organizations list-policies-for-target \
+  --target-id ACCOUNT_ID \
+  --filter SERVICE_CONTROL_POLICY
+```
+
+---
+
+## PART 19 — API GATEWAY DEEP DIVE
+
+### Three Types — When to Use Each
+
+```
+REST API:
+  Most feature-rich, available since 2015
+  Supports: request/response transformation, caching, API keys
+  More expensive: ~$3.50 per million requests
+  Use for: complex APIs needing transformation, legacy integrations
+  
+HTTP API:
+  Newer (2019), simpler, 70% cheaper (~$1.00 per million)
+  Supports: JWT auth, OIDC, OAuth, Lambda proxy, HTTP proxy
+  Missing: request transformation, caching, API keys
+  Use for: most new serverless APIs — simpler + cheaper
+  Recommendation: default to HTTP API unless you need REST features
+
+WebSocket API:
+  Persistent bidirectional connections
+  Use for: chat apps, live notifications, real-time dashboards
+  Client connects once → stays connected → server can push anytime
+  
+  Your case:
+    New court filing → notify lawyer immediately (WebSocket)
+    vs polling every 30 seconds (REST) — WebSocket is better UX
+
+Private API:
+  Only accessible from inside VPC
+  Client → VPC endpoint → API Gateway → Lambda
+  Never exposed to internet
+  Use for: internal microservices, backend-to-backend calls
+```
+
+### Key Features
+
+```
+Throttling (rate limiting):
+  Account level:  10,000 req/sec, 5,000 burst (AWS default)
+  Stage level:    override per API/stage
+  Method level:   GET /cases → 1000 req/sec, POST /cases → 100 req/sec
+  Usage plans:    per API key — "client A gets 500 req/sec"
+  
+  429 Too Many Requests → client being throttled
+
+Caching:
+  Cache responses at API Gateway level (Redis-like)
+  TTL: 300 seconds default (0 to 3600)
+  Cache key: method + path + query params + headers
+  
+  "GET /cases → result cached 5 min → Lambda NOT called again"
+  Reduces Lambda cost significantly for read-heavy APIs
+  Cache size: 0.5GB to 237GB (costs extra)
+  
+  Invalidate: Cache-Control: max-age=0 header from client
+
+Authorizers:
+  Lambda authorizer: run custom code to validate token
+    client sends: Authorization: Bearer eyJhbGc...
+    API GW calls your Lambda with the token
+    Lambda returns: allow or deny + IAM policy
+    
+  Cognito authorizer: validate JWT from Cognito automatically
+    No custom code needed
+    Decodes JWT, verifies signature, checks expiry
+    
+  IAM authorizer: AWS Signature V4 (for internal service-to-service)
+
+Stages:
+  v1/dev, v1/staging, v1/prod
+  Each stage: own URL, own throttling, own caching, own logging
+  Stage variables: like env vars for API GW
+    stageVariables.lambdaAlias = "PROD" or "DEV"
+    Lambda ARN: function:${stageVariables.lambdaAlias}
+
+Request/Response transformation (REST API only):
+  Rename fields, add/remove headers, restructure JSON
+  Before reaching Lambda (save Lambda compute)
+  Before returning to client (normalize response format)
+```
+
+```bash
+# Create HTTP API (recommended for new APIs)
+aws apigatewayv2 create-api \
+  --name judicial-http-api \
+  --protocol-type HTTP \
+  --cors-configuration '{
+    "AllowOrigins": ["https://judicialsolutions.in"],
+    "AllowMethods": ["GET", "POST", "PUT", "DELETE"],
+    "AllowHeaders": ["Authorization", "Content-Type"]
+  }'
+
+# Create Lambda integration
+aws apigatewayv2 create-integration \
+  --api-id API_ID \
+  --integration-type AWS_PROXY \
+  --integration-uri arn:aws:lambda:ap-south-1:ACCOUNT:function:judicial-api \
+  --payload-format-version 2.0
+
+# Create route
+aws apigatewayv2 create-route \
+  --api-id API_ID \
+  --route-key "GET /cases" \
+  --target "integrations/INTEGRATION_ID"
+
+# Deploy
+aws apigatewayv2 create-stage \
+  --api-id API_ID \
+  --stage-name prod \
+  --auto-deploy true
+
+# Add Cognito JWT authorizer
+aws apigatewayv2 create-authorizer \
+  --api-id API_ID \
+  --name cognito-auth \
+  --authorizer-type JWT \
+  --identity-source '$request.header.Authorization' \
+  --jwt-configuration '{
+    "Audience": ["your-cognito-client-id"],
+    "Issuer": "https://cognito-idp.ap-south-1.amazonaws.com/ap-south-1_POOL_ID"
+  }'
+```
+
+### API Gateway + Lambda Integration Modes
+
+```
+Lambda Proxy Integration (recommended):
+  API GW passes EVERYTHING to Lambda as-is
+  Lambda receives full event: headers, body, path, method, queryString
+  Lambda returns: statusCode, headers, body
+  No transformation at API GW level
+  
+  event = {
+    "httpMethod": "GET",
+    "path": "/cases",
+    "queryStringParameters": {"status": "active"},
+    "headers": {"Authorization": "Bearer ..."},
+    "body": None
+  }
+
+Lambda Non-Proxy (REST API only):
+  API GW transforms request before calling Lambda
+  API GW transforms Lambda response before returning to client
+  More complex but useful for: existing Lambda expecting specific format
+
+Common issues:
+  CORS errors: set CORS on API GW, OR handle in Lambda response
+    headers: {"Access-Control-Allow-Origin": "*"}
+    
+  Cold start: Lambda takes 2-5s on first call
+    Fix: provisioned concurrency OR use smaller Lambda
+    
+  Timeout: API GW max timeout = 29 seconds
+    Lambda max = 15 minutes
+    If Lambda takes > 29s → API GW times out with 504
+    Fix: async pattern (SQS + return job ID immediately)
+```
+
+---
+
+## UPDATED TABLE OF CONTENTS
+
+> Parts 15-19 added: SSM, CloudTrail/Config, Kinesis, Organizations/SCPs, API Gateway
+
+| # | Section | Key Topics |
+|---|---|---|
+| 1 | EC2 Deep Dive | Instance types, EBS, ASG, Spot, User Data |
+| 2 | S3 Deep Dive | Storage classes, Versioning, Lifecycle, Security |
+| 3 | Database Comparison | RDS vs DynamoDB vs Redis — decision guide |
+| 4 | RDS + Aurora | Multi-AZ, Read Replicas, Aurora, DMS |
+| 5 | CloudWatch | Metrics, Logs Insights, Alarms, Agent |
+| 6 | Route53 | DNS types, Routing policies, Health checks |
+| 7 | SQS + SNS + EventBridge | Queues, Pub-sub, Event-driven |
+| 8 | AWS Security | WAF, Shield, GuardDuty, Security Hub |
+| 9 | ECS Deep Dive | Task definitions, Fargate, vs EKS |
+| 10 | Cost Optimisation | Reserved, Savings Plans, Spot, tools |
+| 11 | AWS Networking | VPC Peering, TGW, Direct Connect |
+| 12 | CloudFormation vs Terraform | When to use which |
+| 13 | Well-Architected Framework | All 6 pillars |
+| 14 | VPC Complete Deep Dive | All VPC components, interview Q&As |
+| **15** | **SSM** | **Session Manager, Parameter Store, Patch Manager, Run Command** |
+| **16** | **CloudTrail + Config** | **Audit trail, compliance rules, remediation** |
+| **17** | **Kinesis** | **Streams, Firehose, Analytics — real-time data** |
+| **18** | **Organizations + SCPs** | **Multi-account, guardrails, security boundaries** |
+| **19** | **API Gateway Deep Dive** | **REST vs HTTP vs WebSocket, auth, throttling** |
