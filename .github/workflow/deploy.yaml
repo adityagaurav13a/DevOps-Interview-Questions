@@ -1,0 +1,24 @@
+name: Github AWS OIDC Deployment
+
+on:
+  push:
+    branches:
+      - github_Action_OIDC
+      
+permissions:
+  id-token: write
+  content: read
+  
+jobs:
+  OIDC-Deployment:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+      - name: configure aws credentials using OIDC
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Test AWS CLI access
+        run: aws sts get-caller-identity
