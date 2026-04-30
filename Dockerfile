@@ -1,20 +1,12 @@
-# Use official Node image
-FROM node:18-alpine
+FROM nginx:alpine
 
-# Create app directory
-WORKDIR /app
+# Remove default nginx static files
+RUN rm -rf /usr/share/nginx/html/*
 
-# Copy package files first (for caching)
-COPY package*.json ./
+# Copy your static content
+COPY . /usr/share/nginx/html
 
-# Install dependencies
-RUN npm install --omit=dev
+# Expose port
+EXPOSE 80
 
-# Copy rest of the code
-COPY . .
-
-# Expose port (change if your app uses different port)
-EXPOSE 3000
-
-# Start the app
-CMD ["npm", "start"]
+CMD ["nginx", "-g", "daemon off;"]
